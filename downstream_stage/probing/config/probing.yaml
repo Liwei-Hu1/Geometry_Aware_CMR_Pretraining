@@ -1,0 +1,24 @@
+general:
+  checkpoint: "./save_ckpt/run_pretrain/checkpoint-299.pth"
+  log_dir: "./save_ckpt/run_probing"
+  output_dir: "./save_ckpt/run_probing"
+  device: "cuda:0"
+  epochs: 10
+  max_batches: 50   # batches used for feature extraction (reduce if OOM)
+
+data:
+  processed_dir: "./train_data"
+  num_train: 3950
+  num_val: 10
+  load_seg: true
+  image_size: 112
+  time_frame: 32
+  sax_slice_num: 6
+  tubelet_size: 8
+  img_patch_size: [4, 4]
+  mask_ratio: 0.0
+  num_classes: 6
+  dataset_cls: "Cardiac3DplusTAllAX"
+
+module:
+  module_name: "pretrain_multivideomae_tiny_patch4_112"

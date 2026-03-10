@@ -1,0 +1,56 @@
+general:
+  seed: 0
+  wandb_disabled: false
+  freeze_encoder: false
+  resume_training: false
+  load_encoder: false
+  log_dir: "./save_ckpt/run_pretrain_test"
+  output_dir: "./save_ckpt/run_pretrain_test"
+  ckpt_path: ""
+  save_ckpt_freq: 25
+  device: "cuda"
+  resume: ""
+  auto_resume: false
+
+data:
+  processed_dir: "./train_data"
+  num_train: 3950
+  num_val: 10
+  num_test: 10
+  load_seg: false
+  augment: false
+  image_size: 112
+  time_frame: 32
+  sax_slice_num: 8
+  tubelet_size: 8
+  img_patch_size: [4,4]
+  mask_ratio: 0.75
+  batch_size: 2
+  num_workers: 2
+  dataset_cls: "Cardiac3DplusTAllAX"
+  pin_mem: true
+
+module:
+  # pretrain_multivideomae_tiny_patch4_112 or pretrain_multivideomae_tiny_patch8_112 or pretrain_multivideomae_small_patch8_112
+  module_name: "pretrain_multivideomae_tiny_patch4_112"
+
+  optimizer_params:
+    lr: 1e-4
+    min_lr: 0.
+    warmup_lr: 1e-5
+    use_checkpoint: false
+    opt: "adamw"
+    weight_decay: 0.05
+    weight_decay_end: null
+    opt_eps: 1e-8
+    opt_betas: null
+    drop_path: 0.0
+    start_epoch: 0
+    clip_grad: null
+    momentum: 0.9
+
+  secheduler_params:
+    epochs: 300
+    warmup_steps: -1
+    warmup_epochs: 20
+

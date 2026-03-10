@@ -1,0 +1,49 @@
+[project]
+name = "multimodal-cardiac-cycle-generation"
+version = "0.1.0"
+description = "Multimodal cardiac cycle generation toolkit for VideoMAE pretraining."
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["cardiac", "video", "mae", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+authors = [
+    { name = "Liwei" },
+]
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "scipy>=1.9.0",
+    "omegaconf>=2.3.0",
+    "tensorboardx>=2.6.0",
+    "matplotlib>=3.7.0",
+    "einops>=0.6.0",
+    "timm>=0.9.0",
+    "nibabel>=5.0.0",
+    "scikit-image>=0.20.0",
+    "scikit-learn>=1.2.0",
+    "tqdm>=4.65.0",
+    "imageio>=2.30.0",
+    "monai==1.3.2",
+    "medutils==0.1.21"
+]
+
+[project.optional-dependencies]
+apex = [
+    "apex @ git+https://github.com/NVIDIA/apex.git@master#egg=apex",
+]
+
+[project.scripts]
+pretrain = "pretrain_stage.main_pretrain:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests*"]
