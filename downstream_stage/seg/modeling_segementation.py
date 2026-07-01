@@ -163,9 +163,19 @@ def build_segmentation_config(
     img_size: int = 112,
     num_frames: int = 32,
     tubelet_size: int = 8,
+    patch_size: int = 4,
     num_slices: int = 6,
     decoder_feature: int = 32,
 ) -> SegmentationModelConfig:
+    if num_frames % tubelet_size != 0:
+        raise ValueError(
+            f"num_frames ({num_frames}) must be divisible by tubelet_size ({tubelet_size})"
+        )
+    if img_size % patch_size != 0:
+        raise ValueError(
+            f"img_size ({img_size}) must be divisible by patch_size ({patch_size})"
+        )
+
     cfg = replace(_default_tiny_patch8)
     cfg.img_size = img_size
     cfg.num_frames = num_frames
@@ -173,6 +183,12 @@ def build_segmentation_config(
     cfg.tubelet_size = tubelet_size
     cfg.decoder_feature = decoder_feature
     cfg.decoder_num_classes = num_classes
+    cfg.decoder_grid_size = (
+        num_slices,
+        num_frames // tubelet_size,
+        img_size // patch_size,
+        img_size // patch_size,
+    )
     return cfg
 
 
@@ -635,6 +651,7 @@ def create_segmentation_model(
         img_size=img_size,
         num_frames=num_frames,
         tubelet_size=tubelet_size,
+        patch_size=patch_size,
         num_slices=num_slices,
         decoder_feature=decoder_feature,
     )

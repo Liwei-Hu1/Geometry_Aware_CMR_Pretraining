@@ -229,7 +229,16 @@ def build_model(module_cfg: DictConfig) -> torch.nn.Module:
             f"Model {model_name} not registered in modeling_pretrain.MODEL_REGISTRY."
         )
     logger.info("Creating model %s", model_name)
-    return constructor()
+    model_kwargs = {}
+    for key in (
+        "volume_head_type",
+        "geo_window_radius",
+        "geo_distance_alpha",
+        "geo_q_chunk_size",
+    ):
+        if key in module_cfg:
+            model_kwargs[key] = module_cfg[key]
+    return constructor(**model_kwargs)
 
 
 def save_training_logs(

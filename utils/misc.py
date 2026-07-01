@@ -378,6 +378,11 @@ def init_distributed_mode(args: Any) -> None:
         os.environ["LOCAL_RANK"] = str(args.gpu)
         os.environ["RANK"] = str(args.rank)
         os.environ["WORLD_SIZE"] = str(args.world_size)
+    # Prefer torchrun-provided env vars when both torchrun and Slurm vars exist.
+    elif "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        args.gpu = int(os.environ.get("LOCAL_RANK", 0))
     elif "SLURM_PROCID" in os.environ:
         args.rank = int(os.environ["SLURM_PROCID"])
         args.gpu = int(os.environ["SLURM_LOCALID"])
@@ -390,10 +395,6 @@ def init_distributed_mode(args: Any) -> None:
         addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
         if "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = addr
-    elif "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
     else:
         print("Not using distributed mode")
         args.distributed = False
@@ -402,7 +403,7 @@ def init_distributed_mode(args: Any) -> None:
     args.distributed = True
 
     torch.cuda.set_device(args.gpu)
-    args.dist_backend = "gloo"
+    args.dist_backend = "nccl" if torch.cuda.is_available() else "gloo"
     print(
         "| distributed init (rank {}): {}, gpu {}".format(
             args.rank, args.dist_url, args.gpu

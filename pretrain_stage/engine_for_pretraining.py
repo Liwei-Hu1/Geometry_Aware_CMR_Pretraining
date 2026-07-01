@@ -2,15 +2,9 @@ import logging
 import math
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from numpy import ndarray as NDArray
-from torch import Tensor
 from torch.optim import Optimizer
 
 from utils.misc import (
@@ -210,7 +204,6 @@ def train_one_epoch(
 
     header = f"Epoch: [{epoch}]"
     print_freq = 10
-    loss_func = nn.MSELoss()
 
     for step, batch in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
@@ -231,24 +224,20 @@ def train_one_epoch(
         # --- Hybrid Cross-View Masking Strategy ---
         B, S, T, H, W = videos.shape
         window_size = (T // patch_size[0], H // patch_size[1], W // patch_size[2])
-        bool_masked_pos = [
+        mask_stack = torch.stack([
             mask.to(device, non_blocking=True).flatten(1).to(torch.bool)
             for mask in masks
-        ]
+        ], dim=1)
 
         # [New] View-Drop Logic: Always drop 2 entire views per sample
-        total_dropped_views = 0
+        drop_count = min(2, S)
         is_dropped = torch.zeros(B, S, dtype=torch.bool, device=device)
-        for b in range(B):
-            # Randomly pick 2 distinct views to drop (100% mask)
-            v_indices = torch.randperm(S, device=device)[:2]
-            for v_idx in v_indices:
-                v_idx = v_idx.item()
-                bool_masked_pos[v_idx][b, :] = True
-                is_dropped[b, v_idx] = True
-                total_dropped_views += 1
+        drop_indices = torch.rand(B, S, device=device).topk(drop_count, dim=1).indices
+        is_dropped.scatter_(1, drop_indices, True)
+        mask_stack.masked_fill_(is_dropped.unsqueeze(-1), True)
+        bool_masked_pos = list(mask_stack.unbind(dim=1))
+        total_dropped_views = B * drop_count
 
-        # construct labels for reconstruction loss
         with torch.no_grad():
             videos_patches = rearrange(
                 videos,
@@ -257,13 +246,6 @@ def train_one_epoch(
                 p1=patch_size[1],
                 p2=patch_size[2],
             )
-
-            B, _, _, C = videos_patches.shape
-
-            labels = [
-                videos_patches[:, idx, ...][mask].reshape(B, -1, C)
-                for idx, mask in enumerate(bool_masked_pos)
-            ]
 
             videos_patches_target = videos_patches
 
@@ -277,9 +259,6 @@ def train_one_epoch(
         n_lax = 3
         assert S >= n_lax, f"S={S} must be >= {n_lax}"
 
-        sax_idx = torch.arange(0, S - n_lax, device=videos.device)
-        lax_idx = torch.arange(S - n_lax, S, device=videos.device)
-
         pred_sax = outputs["sax"]  # (B, S-3, ...)
         pred_lax = outputs["lax"]  # (B, 3, ...)
 
@@ -292,65 +271,64 @@ def train_one_epoch(
 
         # Apply mask: Only compute loss on MASKED patches
         # bool_masked_pos is list of [B, N], stack to [B, S, N]
-        mask_flat = torch.stack(bool_masked_pos, dim=1)
+        mask_flat = mask_stack
 
         loss_recon = (loss_pixel * mask_flat).sum() / (mask_flat.sum() + 1e-6)
 
-        pred_all_denorm = pred_all
+        with torch.no_grad():
+            single_view_outputs = [pred_all[:, s, ...] for s in range(S)]
+            single_view_recon = reconstruct_video(
+                videos_patches,
+                single_view_outputs,
+                bool_masked_pos,
+                patch_size,
+                window_size,
+            )
 
-        single_view_outputs = [pred_all_denorm[:, s, ...] for s in range(S)]
+            recon_videos_fp32 = single_view_recon.float()
+            videos_fp32 = videos.float()
 
-        single_view_recon = reconstruct_video(
-            videos_patches,
-            single_view_outputs,
-            bool_masked_pos,
-            patch_size,
-            window_size,
-        )
+            # Differentiate metrics for VISIBLE vs DROPPED views
+            vis_mask_list = [
+                bool_masked_pos[s] & (~is_dropped[:, s].unsqueeze(-1)) for s in range(S)
+            ]
+            drop_mask_list = [
+                bool_masked_pos[s] & (is_dropped[:, s].unsqueeze(-1)) for s in range(S)
+            ]
 
-        recon_videos_fp32 = single_view_recon.float()
+            vis_v_psnr = masked_only_psnr(
+                recon_videos_fp32,
+                videos_fp32,
+                vis_mask_list,
+                patch_size=patch_size,
+                window_size=window_size,
+                max_val=1.0,
+            )
+            vis_v_ssim = masked_only_ssim(
+                recon_videos_fp32,
+                videos_fp32,
+                vis_mask_list,
+                patch_size=patch_size,
+                window_size=window_size,
+                data_range=1.0,
+            )
 
-        # Differentiate metrics for VISIBLE vs DROPPED views
-        vis_mask_list = [
-            bool_masked_pos[s] & (~is_dropped[:, s].unsqueeze(-1)) for s in range(S)
-        ]
-        drop_mask_list = [
-            bool_masked_pos[s] & (is_dropped[:, s].unsqueeze(-1)) for s in range(S)
-        ]
-
-        vis_v_psnr = masked_only_psnr(
-            recon_videos_fp32,
-            videos.float(),
-            vis_mask_list,
-            patch_size=patch_size,
-            window_size=window_size,
-            max_val=1.0,
-        )
-        vis_v_ssim = masked_only_ssim(
-            recon_videos_fp32,
-            videos.float(),
-            vis_mask_list,
-            patch_size=patch_size,
-            window_size=window_size,
-            data_range=1.0,
-        )
-
-        mask_v_psnr = masked_only_psnr(
-            recon_videos_fp32,
-            videos.float(),
-            drop_mask_list,
-            patch_size=patch_size,
-            window_size=window_size,
-            max_val=1.0,
-        )
-        mask_v_ssim = masked_only_ssim(
-            recon_videos_fp32,
-            videos.float(),
-            drop_mask_list,
-            patch_size=patch_size,
-            window_size=window_size,
-            data_range=1.0,
-        )
+            mask_v_psnr = masked_only_psnr(
+                recon_videos_fp32,
+                videos_fp32,
+                drop_mask_list,
+                patch_size=patch_size,
+                window_size=window_size,
+                max_val=1.0,
+            )
+            mask_v_ssim = masked_only_ssim(
+                recon_videos_fp32,
+                videos_fp32,
+                drop_mask_list,
+                patch_size=patch_size,
+                window_size=window_size,
+                data_range=1.0,
+            )
 
         loss = loss_recon
 
@@ -370,7 +348,6 @@ def train_one_epoch(
             create_graph=is_second_order,
         )
         loss_scale_value = loss_scaler.state_dict()["scale"]
-        torch.cuda.synchronize()
 
         loss_value = loss.item()
         metric_logger.update(loss=loss_value)
@@ -438,6 +415,21 @@ def reconstruct_video(
         torch.Tensor: De-patched reconstructed videos, shape [B, S, T, H, W].
     """
     B, S, N, C = combined_videos_patch.shape
+    if all(out.shape[1] == N for out in single_view_outputs):
+        outputs = torch.stack([out.float() for out in single_view_outputs], dim=1)
+        mask = torch.stack(bool_masked_pos, dim=1).unsqueeze(-1)
+        recon_patches = torch.where(mask, outputs, combined_videos_patch)
+        return rearrange(
+            recon_patches,
+            "b s (t h w) (p0 p1 p2) -> b s (t p0) (h p1) (w p2)",
+            p0=patch_size[0],
+            p1=patch_size[1],
+            p2=patch_size[2],
+            t=window_size[0],
+            h=window_size[1],
+            w=window_size[2],
+        )
+
     recon_patches = combined_videos_patch.clone()  # [B, S, N, C]
     recon_videos = []
 

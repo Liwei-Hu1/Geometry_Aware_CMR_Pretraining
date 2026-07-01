@@ -86,7 +86,8 @@ python data/build_dataset.py \
     --expected_t 50 \
     --crop_size 112 \
     --seg_label 2 \
-    --workers 16
+    --workers 16 \
+    --max_cases 400
 ```
  
 | Argument | Description | Default |
@@ -98,6 +99,7 @@ python data/build_dataset.py \
 | `--crop_size` | Centre-crop spatial dimension | `112` |
 | `--seg_label` | nnUNet label used to compute the crop centre | `2` |
 | `--workers` | Parallel CPU processes | `16` |
+| `--max_cases` | Maximum patient cases to process (`<=0` means all) | `0` |
  
 Failed cases are logged to `<output_dir>/failed_processing_logs.txt`.
  

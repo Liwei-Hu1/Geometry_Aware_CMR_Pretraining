@@ -702,6 +702,298 @@ class ThreeDVolumeHead(nn.Module):
         return rec_features
 
 
+class SplatVolumeHead(nn.Module):
+    """
+    Builds an anatomy-aligned coarse 3D feature volume by splatting visible patch
+    tokens into the voxel grid according to their per-patch 3D coordinates.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 192,
+        volume_size: tuple = (16, 16, 16),
+        grid_scale_factor: float = 4.0,
+        refine_depth: int = 2,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.volume_dim = embed_dim
+        self.volume_size = volume_size
+        self.grid_scale_factor = grid_scale_factor
+
+        refine_layers = []
+        for _ in range(refine_depth):
+            refine_layers.extend(
+                [
+                    nn.Conv3d(embed_dim, embed_dim, kernel_size=3, padding=1),
+                    nn.GroupNorm(8, embed_dim),
+                    nn.GELU(),
+                ]
+            )
+        self.refine = nn.Sequential(*refine_layers)
+        self.norm_slice = nn.LayerNorm(embed_dim)
+
+    def trilinear_splat(
+        self,
+        feats: torch.Tensor,
+        coords: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            feats: [B, N, C] visible patch features.
+            coords: [B, N, 3] patch coordinates in the same normalized space used
+                by the current grid_sample reprojection.
+            valid: [B, N] optional mask for padded visible-token slots.
+
+        Returns:
+            torch.Tensor: [B, C, X, Y, Z] splatted feature volume.
+        """
+        B, N, C = feats.shape
+        X, Y, Z = self.volume_size
+
+        if valid is None:
+            valid = torch.ones(B, N, device=feats.device, dtype=feats.dtype)
+        else:
+            valid = valid.to(device=feats.device, dtype=feats.dtype)
+
+        grid = (coords / self.grid_scale_factor).clamp(-1, 1)
+        gx = (grid[..., 0] + 1) * 0.5 * (X - 1)
+        gy = (grid[..., 1] + 1) * 0.5 * (Y - 1)
+        gz = (grid[..., 2] + 1) * 0.5 * (Z - 1)
+
+        x0 = gx.floor().long().clamp(0, X - 1)
+        y0 = gy.floor().long().clamp(0, Y - 1)
+        z0 = gz.floor().long().clamp(0, Z - 1)
+        x1 = (x0 + 1).clamp(0, X - 1)
+        y1 = (y0 + 1).clamp(0, Y - 1)
+        z1 = (z0 + 1).clamp(0, Z - 1)
+
+        wx = gx - x0.float()
+        wy = gy - y0.float()
+        wz = gz - z0.float()
+
+        volume = feats.new_zeros(B, C, X * Y * Z)
+        weight_sum = feats.new_zeros(B, 1, X * Y * Z)
+
+        def add(ix: torch.Tensor, iy: torch.Tensor, iz: torch.Tensor, w: torch.Tensor) -> None:
+            w = w * valid
+            lin = ix * (Y * Z) + iy * Z + iz
+            src = feats * w.unsqueeze(-1)
+            volume.scatter_add_(2, lin.unsqueeze(1).expand(-1, C, -1), src.transpose(1, 2))
+            weight_sum.scatter_add_(2, lin.unsqueeze(1), w.unsqueeze(1))
+
+        add(x0, y0, z0, (1 - wx) * (1 - wy) * (1 - wz))
+        add(x0, y0, z1, (1 - wx) * (1 - wy) * wz)
+        add(x0, y1, z0, (1 - wx) * wy * (1 - wz))
+        add(x0, y1, z1, (1 - wx) * wy * wz)
+        add(x1, y0, z0, wx * (1 - wy) * (1 - wz))
+        add(x1, y0, z1, wx * (1 - wy) * wz)
+        add(x1, y1, z0, wx * wy * (1 - wz))
+        add(x1, y1, z1, wx * wy * wz)
+
+        volume = volume / weight_sum.clamp_min(1e-6)
+        return volume.reshape(B, C, X, Y, Z)
+
+    def forward(
+        self,
+        visible_feats: torch.Tensor,
+        visible_coords: torch.Tensor,
+        query_coords: torch.Tensor,
+        visible_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            visible_feats: [B, N_vis_all, C] visible patch tokens.
+            visible_coords: [B, N_vis_all, 3] coordinates for visible patch tokens.
+            query_coords: [B, S, N_spatial_patches, 3] coordinates to sample back
+                onto the input slice grids.
+            visible_valid: [B, N_vis_all] optional validity mask for padded tokens.
+        """
+        volume = self.trilinear_splat(visible_feats, visible_coords, visible_valid)
+        volume = volume + self.refine(volume)
+
+        B, S, N_sp, _ = query_coords.shape
+        grid = (query_coords.reshape(B, S * N_sp, 3) / self.grid_scale_factor).clamp(-1, 1)
+        grid_5d = grid.unsqueeze(2).unsqueeze(3)
+
+        sampled = F.grid_sample(
+            volume,
+            grid_5d,
+            mode="bilinear",
+            align_corners=True,
+            padding_mode="zeros",
+        )
+        rec_features = sampled.squeeze(-1).squeeze(-1).permute(0, 2, 1)
+        rec_features = self.norm_slice(rec_features).reshape(B, S, N_sp, -1)
+        return volume, rec_features
+
+
+class LocalGeoCrossAttentionBlock(nn.Module):
+    """Cross-attention from voxel queries to nearby patch tokens."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        distance_alpha: float = 4.0,
+        window_radius: Optional[float] = None,
+        q_chunk_size: int = 512,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.distance_alpha = distance_alpha
+        self.window_radius = window_radius
+        self.q_chunk_size = q_chunk_size
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_k = nn.LayerNorm(dim)
+        self.norm_v = nn.LayerNorm(dim)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_coords: torch.Tensor,
+        k_coords: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, Nv, C = q.shape
+        Nt = k.shape[1]
+        q = self.q_proj(self.norm_q(q)).reshape(B, Nv, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(self.norm_k(k)).reshape(B, Nt, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(self.norm_v(v)).reshape(B, Nt, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if q_coords.dim() == 2:
+            q_coords = q_coords.unsqueeze(0).expand(B, -1, -1)
+
+        outputs = []
+        chunk_size = max(1, self.q_chunk_size)
+        for start in range(0, Nv, chunk_size):
+            end = min(start + chunk_size, Nv)
+            q_chunk = q[:, :, start:end, :]
+            qc = q_coords[:, start:end, :]
+            dist2 = torch.cdist(qc, k_coords).pow(2)
+
+            logits = torch.matmul(q_chunk, k.transpose(-2, -1)) * self.scale
+            logits = logits - self.distance_alpha * dist2.unsqueeze(1)
+
+            allowed = torch.ones_like(dist2, dtype=torch.bool)
+            if self.window_radius is not None and self.window_radius > 0:
+                allowed = allowed & (dist2 <= (self.window_radius ** 2))
+
+            if valid is not None:
+                allowed = allowed & valid[:, None, :].bool()
+
+            logits = logits.masked_fill(~allowed[:, None, :, :], -torch.finfo(logits.dtype).max)
+            attn = logits.softmax(dim=-1)
+            # Empty local windows should contribute no feature instead of falling
+            # back to a global or uniform attention pattern.
+            attn = attn.masked_fill(~allowed[:, None, :, :], 0.0)
+            outputs.append(torch.matmul(attn, v))
+
+        out = torch.cat(outputs, dim=2)
+        out = out.transpose(1, 2).reshape(B, Nv, C)
+        return self.out_proj(out)
+
+
+class LocalGeoVolumeHead(nn.Module):
+    """
+    Builds Vcoarse with geometry-constrained voxel-to-patch cross-attention.
+    Each voxel aggregates visible patch tokens with a distance bias in normalized
+    3D coordinate space.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 192,
+        volume_size: tuple = (16, 16, 16),
+        num_heads: int = 4,
+        grid_scale_factor: float = 4.0,
+        distance_alpha: float = 4.0,
+        window_radius: Optional[float] = None,
+        q_chunk_size: int = 512,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.volume_dim = embed_dim
+        self.volume_size = volume_size
+        self.grid_scale_factor = grid_scale_factor
+
+        X, Y, Z = volume_size
+        num_voxels = X * Y * Z
+        self.volume_queries = nn.Parameter(torch.zeros(1, num_voxels, embed_dim))
+        trunc_normal_(self.volume_queries, std=0.02)
+        self.register_buffer("voxel_coords", self._build_voxel_coords(volume_size), persistent=False)
+        self.register_buffer("volume_pos_embed", ThreeDVolumeHead._build_3d_sincos_pos(volume_size, embed_dim))
+
+        self.local_attn = LocalGeoCrossAttentionBlock(
+            dim=embed_dim,
+            num_heads=num_heads,
+            distance_alpha=distance_alpha,
+            window_radius=window_radius,
+            q_chunk_size=q_chunk_size,
+        )
+        self.norm_vol = nn.LayerNorm(embed_dim)
+        self.norm_slice = nn.LayerNorm(embed_dim)
+
+    @staticmethod
+    def _build_voxel_coords(volume_size: tuple) -> torch.Tensor:
+        X, Y, Z = volume_size
+        xs = torch.linspace(-1.0, 1.0, X)
+        ys = torch.linspace(-1.0, 1.0, Y)
+        zs = torch.linspace(-1.0, 1.0, Z)
+        xx, yy, zz = torch.meshgrid(xs, ys, zs, indexing="ij")
+        return torch.stack([xx, yy, zz], dim=-1).reshape(1, X * Y * Z, 3)
+
+    def forward(
+        self,
+        visible_feats: torch.Tensor,
+        visible_coords: torch.Tensor,
+        query_coords: torch.Tensor,
+        visible_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = visible_feats.shape[0]
+        X, Y, Z = self.volume_size
+        queries = (self.volume_queries + self.volume_pos_embed).expand(B, -1, -1)
+        key_coords = (visible_coords / self.grid_scale_factor).clamp(-1, 1)
+
+        volume_flat = self.local_attn(
+            queries,
+            visible_feats,
+            visible_feats,
+            self.voxel_coords.squeeze(0).type_as(visible_feats),
+            key_coords,
+            visible_valid,
+        )
+        volume_flat = self.norm_vol(volume_flat)
+        volume = volume_flat.permute(0, 2, 1).reshape(B, self.embed_dim, X, Y, Z)
+
+        _, S, N_sp, _ = query_coords.shape
+        grid = (query_coords.reshape(B, S * N_sp, 3) / self.grid_scale_factor).clamp(-1, 1)
+        grid_5d = grid.unsqueeze(2).unsqueeze(3)
+        sampled = F.grid_sample(
+            volume,
+            grid_5d,
+            mode="bilinear",
+            align_corners=True,
+            padding_mode="zeros",
+        )
+        rec_features = sampled.squeeze(-1).squeeze(-1).permute(0, 2, 1)
+        rec_features = self.norm_slice(rec_features).reshape(B, S, N_sp, -1)
+        return volume, rec_features
+
+
 class PretrainVisionTransformer(nn.Module):
     """Combined encoder-decoder architecture used for pretraining (vectorized over S)."""
 
@@ -732,6 +1024,10 @@ class PretrainVisionTransformer(nn.Module):
         recon_types: str = "sax+lax",
         sax_slices: int = 6,
         lax_slices: int = 3,
+        volume_head_type: str = "attention",
+        geo_window_radius: Optional[float] = None,
+        geo_distance_alpha: float = 4.0,
+        geo_q_chunk_size: int = 512,
     ) -> None:
         super().__init__()
         self.num_views = sax_slices + lax_slices
@@ -740,6 +1036,7 @@ class PretrainVisionTransformer(nn.Module):
         self.sax_slices = sax_slices
         self.lax_slices = lax_slices
         self.encoder_embed_dim = encoder_embed_dim
+        self.volume_head_type = volume_head_type
 
         self.shared_encoder = PretrainVisionTransformerEncoder(
             img_size=img_size,
@@ -766,15 +1063,30 @@ class PretrainVisionTransformer(nn.Module):
 
         num_patches = self.shared_encoder.patch_embed.num_patches
         
-        # 3D Volume Head for learning implicit 3D structure
-        # Replaces the explicit decoders
-        self.volume_head = ThreeDVolumeHead(
-            embed_dim=encoder_embed_dim,
-            volume_dim=encoder_embed_dim,
-            volume_size=(16, 16, 16),
-            num_slices=sax_slices + lax_slices,
-            num_patches_per_slice=num_patches
-        )
+        if volume_head_type == "attention":
+            self.volume_head = ThreeDVolumeHead(
+                embed_dim=encoder_embed_dim,
+                volume_dim=encoder_embed_dim,
+                volume_size=(16, 16, 16),
+                num_slices=sax_slices + lax_slices,
+                num_patches_per_slice=num_patches,
+            )
+        elif volume_head_type == "splat":
+            self.volume_head = SplatVolumeHead(
+                embed_dim=encoder_embed_dim,
+                volume_size=(16, 16, 16),
+            )
+        elif volume_head_type == "local_geo":
+            self.volume_head = LocalGeoVolumeHead(
+                embed_dim=encoder_embed_dim,
+                volume_size=(16, 16, 16),
+                num_heads=4,
+                distance_alpha=geo_distance_alpha,
+                window_radius=geo_window_radius,
+                q_chunk_size=geo_q_chunk_size,
+            )
+        else:
+            raise ValueError(f"Unsupported volume_head_type={volume_head_type!r}")
         
         # Decoder (to reconstruct details from 3D features)
         self.encoder_to_decoder = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=False)
@@ -818,6 +1130,64 @@ class PretrainVisionTransformer(nn.Module):
         view_type = view_type_s.unsqueeze(0).expand(B, S).reshape(B * S)
         view_id = view_id_s.unsqueeze(0).expand(B, S).reshape(B * S)
         return view_type, view_id
+
+    def _prepare_splat_inputs(
+        self,
+        enc_patch: torch.Tensor,
+        mask: torch.Tensor,
+        patch_coords_3d: torch.Tensor,
+        B: int,
+        S: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack variable-count visible tokens into padded per-subject splat inputs."""
+        N_sp = patch_coords_3d.shape[2]
+        N_total = mask.shape[1]
+        T_patches = N_total // N_sp
+
+        coords_full = patch_coords_3d.unsqueeze(2).expand(-1, -1, T_patches, -1, -1)
+        coords_full = coords_full.reshape(B * S, N_total, 3)
+        visible_mask = ~mask
+
+        feats_per_batch = []
+        coords_per_batch = []
+        valid_per_batch = []
+        max_tokens = 0
+        for b in range(B):
+            batch_feats = []
+            batch_coords = []
+            for s in range(S):
+                row = b * S + s
+                num_vis = int(visible_mask[row].sum().item())
+                if num_vis > 0:
+                    batch_feats.append(enc_patch[row, :num_vis])
+                    batch_coords.append(coords_full[row, visible_mask[row]])
+
+            if batch_feats:
+                feats_b = torch.cat(batch_feats, dim=0)
+                coords_b = torch.cat(batch_coords, dim=0)
+            else:
+                feats_b = enc_patch.new_zeros(0, enc_patch.shape[-1])
+                coords_b = patch_coords_3d.new_zeros(0, 3)
+
+            feats_per_batch.append(feats_b)
+            coords_per_batch.append(coords_b)
+            valid_per_batch.append(torch.ones(feats_b.shape[0], device=enc_patch.device, dtype=torch.bool))
+            max_tokens = max(max_tokens, feats_b.shape[0])
+
+        if max_tokens == 0:
+            max_tokens = 1
+
+        visible_feats = enc_patch.new_zeros(B, max_tokens, enc_patch.shape[-1])
+        visible_coords = patch_coords_3d.new_zeros(B, max_tokens, 3)
+        visible_valid = torch.zeros(B, max_tokens, device=enc_patch.device, dtype=torch.bool)
+        for b in range(B):
+            n = feats_per_batch[b].shape[0]
+            if n > 0:
+                visible_feats[b, :n] = feats_per_batch[b]
+                visible_coords[b, :n] = coords_per_batch[b]
+                visible_valid[b, :n] = valid_per_batch[b]
+
+        return visible_feats, visible_coords, visible_valid
 
 
     def forward(self, videos: torch.Tensor, masks: List[torch.Tensor],
@@ -863,42 +1233,27 @@ class PretrainVisionTransformer(nn.Module):
         enc_cls = x_vis[:, :1, :]
         enc_patch = x_vis[:, 1:, :] # [B*S, N_vis, D]
 
-        # 2. Volume Head (Cross-Attention + Geometric Projection)
-        # Constructs 3D volume from visible patches
-        volume, rec_from_vol = self.volume_head(enc_patch, patch_coords_3d)
-
-        # rec_from_vol: [B, S, N_sp, volume_dim] (only spatial!)
-        # Decoder expects: [B*S, N_total, decoder_dim]
-        # We need to expand spatial-only features to temporal tubelets
-        B_dec, S_dec, N_sp, C_vol = rec_from_vol.shape
-        # Total patches = T * N_sp (but T here is tubelets)
-        # We can infer T_patches from self.decoder_pos_embed.shape[1] // N_sp
-        N_total = self.decoder_pos_embed.shape[1]
-        T_patches = N_total // N_sp
-        
-        # Expand: [B, S, N_sp, C] -> [B, S, 1, N_sp, C] -> [B, S, T_p, N_sp, C]
-        rec_spatial = rec_from_vol.unsqueeze(2).expand(-1, -1, T_patches, -1, -1)
-        # Reshape to [B, S, N_total, C]
-        rec_expanded = rec_spatial.reshape(B_dec, S_dec, N_total, C_vol)
-
-        # 3. Decode
-        # Reproject volume features to decoder dim
-        x_rec = self.encoder_to_decoder(rec_expanded) # [B, S, N, D_dec]
-        
-        # Reshape to expected decoder input [B*S, N, D_dec]
-        x_rec = x_rec.reshape(B*S, -1, self.decoder.embed_dim)
-        
-        # Add decoder pos embed
-        x_rec = x_rec + self.decoder_pos_embed.type_as(x_rec)
-
-        # 4. Final Reconstruction
-        # [B*S, N, D_dec] -> [B*S, N, pixel_dim]
-        logits = self.decoder(x_rec, return_token_num=0)
-        
-        # 3D Volume Estimation & Geometric Reconstruction
+        # 2. 3D Volume Estimation & Geometric Reconstruction
         vol_patch_coords = patch_coords_3d.to(device) if patch_coords_3d is not None else None
         vol_spatial = spatial_coords.to(device) if spatial_coords is not None else None
-        volume_3d, rec_features_spatial = self.volume_head(enc_patch, patch_coords_3d=vol_patch_coords, spatial_coords=vol_spatial)
+        if self.volume_head_type in {"splat", "local_geo"}:
+            if vol_patch_coords is None:
+                raise ValueError(f"volume_head_type={self.volume_head_type!r} requires patch_coords_3d")
+            visible_feats, visible_coords, visible_valid = self._prepare_splat_inputs(
+                enc_patch, mask, vol_patch_coords, B, S
+            )
+            volume_3d, rec_features_spatial = self.volume_head(
+                visible_feats,
+                visible_coords,
+                vol_patch_coords,
+                visible_valid,
+            )
+        else:
+            volume_3d, rec_features_spatial = self.volume_head(
+                enc_patch,
+                patch_coords_3d=vol_patch_coords,
+                spatial_coords=vol_spatial,
+            )
         # rec_features_spatial: [B, S, N_sp, D] where N_sp = spatial patches (784)
         
         intermidiate_value = rec_features_spatial.clone()
@@ -1009,12 +1364,15 @@ class PretrainVisionTransformer(nn.Module):
 
 @register_model("pretrain_multivideomae_tiny_patch4_112")
 def pretrain_multivideomae_tiny_patch4_112(pretrained: bool = False, **kwargs: object) -> PretrainVisionTransformer:
+    sax_slices = int(kwargs.pop("sax_slices", 6))
+    lax_slices = int(kwargs.pop("lax_slices", 3))
     model = PretrainVisionTransformer(
         img_size=112,
-        sax_slices=6,
-        tubelet_size=8,
+        sax_slices=sax_slices,
+        lax_slices=lax_slices,
+        tubelet_size=10,
         img_patch_size=4,
-        num_frames=32,
+        num_frames=50,
         encoder_in_chans=1,
         encoder_embed_dim=192,
         encoder_depth=9,
